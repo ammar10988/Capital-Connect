@@ -16,6 +16,7 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { supabase } from '../../../lib/supabase';
 import { useAuthContext } from '../../../context/AuthContext';
+import { assertUuid, canOpenHttpUrl, sanitizePlainText } from '../../../lib/inputSecurity';
 
 interface FounderDetail {
   id: string;
@@ -81,10 +82,11 @@ export default function StartupDetailScreen() {
     setLoading(true);
     setError(null);
     try {
+      const startupId = assertUuid(id, 'startup id');
       const { data, error: err } = await supabase
         .from('founder_profiles')
         .select('*, profile:profiles(first_name, last_name, avatar_url)')
-        .eq('id', id)
+        .eq('id', startupId)
         .single();
 
       if (err) throw err;
@@ -97,7 +99,7 @@ export default function StartupDetailScreen() {
           .from('founder_bookmarks')
           .select('id')
           .eq('investor_id', user.id)
-          .eq('founder_profile_id', id)
+          .eq('founder_profile_id', startupId)
           .maybeSingle();
         if (bm) {
           setBookmarked(true);
@@ -113,13 +115,14 @@ export default function StartupDetailScreen() {
 
   async function toggleBookmark() {
     if (!user || !id) return;
+    const startupId = assertUuid(id, 'startup id');
     if (bookmarked && bookmarkRowId) {
       const { error } = await supabase.from('founder_bookmarks').delete().eq('id', bookmarkRowId);
       if (!error) { setBookmarked(false); setBookmarkRowId(null); }
     } else {
       const { data, error } = await supabase
         .from('founder_bookmarks')
-        .insert({ investor_id: user.id, founder_profile_id: id })
+        .insert({ investor_id: user.id, founder_profile_id: startupId })
         .select('id')
         .single();
       if (!error && data) { setBookmarked(true); setBookmarkRowId((data as { id: string }).id); }
@@ -133,7 +136,7 @@ export default function StartupDetailScreen() {
       const { error } = await supabase.from('founder_intro_requests').insert({
         investor_id: user.id,
         founder_id: startup.profile_id,
-        message: introMsg.trim(),
+        message: sanitizePlainText(introMsg, { maxLength: 500, multiline: true }),
         status: 'pending',
       });
       if (error) throw error;
@@ -239,7 +242,7 @@ export default function StartupDetailScreen() {
             </View>
             <Text style={styles.founderName}>{founderDisplayName}</Text>
             {startup.linkedin_url ? (
-              <TouchableOpacity style={styles.linkedinBtn} onPress={() => Linking.openURL(startup.linkedin_url!)}>
+              <TouchableOpacity style={styles.linkedinBtn} onPress={() => canOpenHttpUrl(startup.linkedin_url!) && Linking.openURL(startup.linkedin_url!)}>
                 <Ionicons name="logo-linkedin" size={14} color="#0077B5" />
               </TouchableOpacity>
             ) : null}
@@ -306,7 +309,7 @@ export default function StartupDetailScreen() {
                 <Text style={styles.introBtnText}>Send Intro Request</Text>
               </TouchableOpacity>
               {startup.website ? (
-                <TouchableOpacity style={styles.iconBtn} onPress={() => Linking.openURL(startup.website!)}>
+                <TouchableOpacity style={styles.iconBtn} onPress={() => canOpenHttpUrl(startup.website!) && Linking.openURL(startup.website!)}>
                   <Ionicons name="globe-outline" size={18} color="#6B7280" />
                 </TouchableOpacity>
               ) : null}

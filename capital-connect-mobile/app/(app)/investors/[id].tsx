@@ -18,6 +18,7 @@ import { Avatar } from '../../../components/ui/Avatar';
 import { Badge } from '../../../components/ui/Badge';
 import { Colors } from '../../../constants/colors';
 import type { ScrapedInvestor } from '../../../types';
+import { assertUuid, canOpenHttpUrl, sanitizePlainText } from '../../../lib/inputSecurity';
 
 export default function InvestorDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -42,6 +43,7 @@ export default function InvestorDetailScreen() {
     const rawId = investorId.startsWith('platform_')
       ? investorId.replace('platform_', '')
       : investorId;
+    assertUuid(rawId, 'investor id');
 
     const { data: intros } = await supabase
       .from('introductions')
@@ -62,6 +64,7 @@ export default function InvestorDetailScreen() {
       const isPlatform = investorId.startsWith('platform_');
       if (isPlatform) {
         const actualId = investorId.replace('platform_', '');
+        assertUuid(actualId, 'investor id');
         const { data, error: err } = await supabase
           .from('investor_profiles')
           .select('id, user_id, title, location, sectors, stage_preference, ticket_size_min, ticket_size_max, investment_thesis, linkedin_url, website_url, actively_investing, is_verified, response_rate, portfolio_count, created_at, fund_name, bank_name, profile:profiles(first_name, last_name, company)')
@@ -126,8 +129,11 @@ export default function InvestorDetailScreen() {
     }
     setSending(true);
     try {
+      if (typeof id !== 'string') {
+        throw new Error('Invalid investor id');
+      }
       const { error: fnError } = await supabase.functions.invoke('send-intro', {
-        body: { investor_id: id, message: introMsg.trim() },
+        body: { investor_id: id, message: sanitizePlainText(introMsg, { maxLength: 500, multiline: true }) },
       });
       if (fnError) throw fnError;
       setIntroSent(true);
@@ -270,12 +276,12 @@ export default function InvestorDetailScreen() {
             </TouchableOpacity>
           )}
           {investor.linkedin_url && (
-            <TouchableOpacity onPress={() => Linking.openURL(investor.linkedin_url!)}>
+            <TouchableOpacity onPress={() => canOpenHttpUrl(investor.linkedin_url!) && Linking.openURL(investor.linkedin_url!)}>
               <Text style={styles.link}>LinkedIn</Text>
             </TouchableOpacity>
           )}
           {investor.website && (
-            <TouchableOpacity onPress={() => Linking.openURL(investor.website!)}>
+            <TouchableOpacity onPress={() => canOpenHttpUrl(investor.website!) && Linking.openURL(investor.website!)}>
               <Text style={styles.link}>Website</Text>
             </TouchableOpacity>
           )}

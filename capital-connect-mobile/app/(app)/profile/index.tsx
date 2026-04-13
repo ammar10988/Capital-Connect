@@ -15,6 +15,7 @@ import * as ImagePicker from 'expo-image-picker';
 import { supabase } from '../../../lib/supabase';
 import { useAuthContext } from '../../../context/AuthContext';
 import { ChipSelector } from '../../../components/onboarding/ChipSelector';
+import { sanitizeOptionalUrl, sanitizePlainText, validateMobileImageAsset } from '../../../lib/inputSecurity';
 
 type TabType = 'public' | 'preferences';
 
@@ -104,7 +105,13 @@ export default function ProfileScreen() {
     setUploading(true);
     try {
       const uri = asset.uri;
-      const ext = uri.split('.').pop()?.toLowerCase() ?? 'jpg';
+      const { extension, mimeType } = validateMobileImageAsset({
+        uri,
+        fileName: asset.fileName,
+        fileSize: asset.fileSize,
+        mimeType: asset.mimeType,
+      });
+      const ext = extension;
       const path = `${user.id}/avatar.${ext}`;
 
       const response = await fetch(uri);
@@ -112,7 +119,7 @@ export default function ProfileScreen() {
 
       const { error: uploadError } = await supabase.storage
         .from('avatars')
-        .upload(path, blob, { upsert: true, contentType: `image/${ext}` });
+        .upload(path, blob, { upsert: true, contentType: mimeType });
 
       if (uploadError) throw uploadError;
 
@@ -142,14 +149,18 @@ export default function ProfileScreen() {
     setSavingPublic(true);
     try {
       await updateProfile({
-        first_name: firstName.trim(),
-        last_name: lastName.trim() || null,
-        company: company.trim() || null,
-        bio: bio.trim() || null,
+        first_name: sanitizePlainText(firstName, { maxLength: 80 }),
+        last_name: sanitizePlainText(lastName, { maxLength: 80 }) || null,
+        company: sanitizePlainText(company, { maxLength: 120 }) || null,
+        bio: sanitizePlainText(bio, { maxLength: 500, multiline: true }) || null,
       });
       if (user && !isFounder) {
         await supabase.from('investor_profiles').upsert(
-          { user_id: user.id, linkedin_url: linkedin.trim() || null, updated_at: new Date().toISOString() },
+          {
+            user_id: user.id,
+            linkedin_url: sanitizeOptionalUrl(linkedin, 'LinkedIn URL') || null,
+            updated_at: new Date().toISOString(),
+          },
           { onConflict: 'user_id' }
         );
       }
@@ -173,7 +184,7 @@ export default function ProfileScreen() {
           geography: selectedGeo,
           ticket_size_min: minTicket ? Number(minTicket) : null,
           ticket_size_max: maxTicket ? Number(maxTicket) : null,
-          investment_thesis: thesis.trim() || null,
+          investment_thesis: sanitizePlainText(thesis, { maxLength: 1000, multiline: true }) || null,
           updated_at: new Date().toISOString(),
         },
         { onConflict: 'user_id' }

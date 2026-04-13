@@ -14,6 +14,7 @@ import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { useAuthContext } from '../../../context/AuthContext';
+import { sanitizePlainText, validateMobileImageAsset } from '../../../lib/inputSecurity';
 import { supabase } from '../../../lib/supabase';
 
 export default function ProfileSettingsScreen() {
@@ -56,7 +57,13 @@ export default function ProfileSettingsScreen() {
     setUploading(true);
     try {
       const uri = asset.uri;
-      const ext = uri.split('.').pop()?.toLowerCase() ?? 'jpg';
+      const { extension, mimeType } = validateMobileImageAsset({
+        uri,
+        fileName: asset.fileName,
+        fileSize: asset.fileSize,
+        mimeType: asset.mimeType,
+      });
+      const ext = extension;
       const path = `${user.id}/avatar.${ext}`;
 
       const response = await fetch(uri);
@@ -64,7 +71,7 @@ export default function ProfileSettingsScreen() {
 
       const { error: uploadError } = await supabase.storage
         .from('avatars')
-        .upload(path, blob, { upsert: true, contentType: `image/${ext}` });
+        .upload(path, blob, { upsert: true, contentType: mimeType });
 
       if (uploadError) throw uploadError;
 
@@ -94,10 +101,10 @@ export default function ProfileSettingsScreen() {
     setSaving(true);
     try {
       await updateProfile({
-        first_name: firstName.trim(),
-        last_name: lastName.trim() || null,
-        company: company.trim() || null,
-        bio: bio.trim() || null,
+        first_name: sanitizePlainText(firstName, { maxLength: 80 }),
+        last_name: sanitizePlainText(lastName, { maxLength: 80 }) || null,
+        company: sanitizePlainText(company, { maxLength: 120 }) || null,
+        bio: sanitizePlainText(bio, { maxLength: 500, multiline: true }) || null,
       });
       Alert.alert('Saved', 'Your profile has been updated.');
     } catch (e: unknown) {

@@ -1,4 +1,12 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { enforceRateLimit } from "../_shared/abuseProtection.ts";
+import {
+  parseJsonObject,
+  requireEnum,
+  sanitizeText,
+  ValidationError,
+} from "../_shared/inputValidation.ts";
+import { logSecurityEvent } from "../_shared/security.ts";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -7,6 +15,10 @@ const CORS_HEADERS = {
 };
 
 type ChatMode = "compliance" | "market-intel" | "fundraising";
+const AI_CHAT_WINDOW_MS = 10 * 60 * 1000;
+const AI_CHAT_MAX_PER_USER = 12;
+const AI_CHAT_MAX_PER_IP = 25;
+const AI_CHAT_MAX_MESSAGE_LENGTH = 4000;
 
 function getAuthToken(req: Request): string | null {
   const authHeader = req.headers.get("Authorization") ?? req.headers.get("authorization");
@@ -72,12 +84,15 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    const { message, mode } = await req.json() as {
-      message?: string;
-      mode?: ChatMode;
-    };
+    const body = await parseJsonObject(req);
+    const mode = requireEnum(body.mode, "mode", ["compliance", "market-intel", "fundraising"] as const);
+    const message = sanitizeText(body.message, "message", {
+      minLength: 1,
+      maxLength: AI_CHAT_MAX_MESSAGE_LENGTH,
+      multiline: true,
+    });
 
-    if (!message?.trim() || !mode) {
+    if (!message || !mode) {
       return new Response(JSON.stringify({ error: "Missing required fields: message, mode" }), {
         status: 400,
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
@@ -98,6 +113,14 @@ Deno.serve(async (req: Request) => {
     } = await authClient.auth.getUser();
 
     if (authError || !user) {
+      const auditClient = createClient(supabaseUrl, serviceRoleKey, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
+      await logSecurityEvent(auditClient, req, {
+        eventType: "ai_chat_unauthorized",
+        severity: "warning",
+        route: "ai-chat",
+      });
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
         status: 401,
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
@@ -114,6 +137,13 @@ Deno.serve(async (req: Request) => {
 
     if (profileError) {
       console.error("Failed to load profile for chat:", profileError);
+      await logSecurityEvent(supabase, req, {
+        eventType: "ai_chat_profile_lookup_failed",
+        severity: "warning",
+        route: "ai-chat",
+        userId: user.id,
+        metadata: { message: profileError.message },
+      });
       return new Response(JSON.stringify({ error: "Failed to load user profile" }), {
         status: 500,
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
@@ -121,6 +151,15 @@ Deno.serve(async (req: Request) => {
     }
 
     const role = profile?.role === "investor" ? "investor" : "founder";
+
+    await enforceRateLimit(supabase, req, {
+      route: "ai-chat",
+      windowMs: AI_CHAT_WINDOW_MS,
+      maxPerIp: AI_CHAT_MAX_PER_IP,
+      maxPerUser: AI_CHAT_MAX_PER_USER,
+      userId: user.id,
+      eventType: "ai_chat_rate_limited",
+    });
 
     const { data: session, error: sessionError } = await supabase
       .from("chat_sessions")
@@ -131,6 +170,13 @@ Deno.serve(async (req: Request) => {
 
     if (sessionError) {
       console.error("Failed to load chat session:", sessionError);
+      await logSecurityEvent(supabase, req, {
+        eventType: "ai_chat_session_lookup_failed",
+        severity: "warning",
+        route: "ai-chat",
+        userId: user.id,
+        metadata: { mode, message: sessionError.message },
+      });
       return new Response(JSON.stringify({ error: "Failed to load chat session" }), {
         status: 500,
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
@@ -149,7 +195,7 @@ Deno.serve(async (req: Request) => {
       },
       contents: [
         ...history,
-        { role: "user", parts: [{ text: message.trim() }] },
+        { role: "user", parts: [{ text: message }] },
       ],
       generationConfig: {
         temperature: 0.7,
@@ -175,6 +221,13 @@ Deno.serve(async (req: Request) => {
     if (!geminiRes.ok) {
       const errText = await geminiRes.text();
       console.error("Gemini API error:", errText);
+      await logSecurityEvent(supabase, req, {
+        eventType: "ai_chat_provider_error",
+        severity: "critical",
+        route: "ai-chat",
+        userId: user.id,
+        metadata: { mode, status: geminiRes.status, detail: errText.slice(0, 500) },
+      });
       return new Response(JSON.stringify({ error: "Gemini API error", detail: errText }), {
         status: 502,
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
@@ -234,7 +287,7 @@ Deno.serve(async (req: Request) => {
 
         const updatedMessages = [
           ...(session?.messages ?? []),
-          { role: "user", content: message.trim(), timestamp: new Date().toISOString() },
+          { role: "user", content: message, timestamp: new Date().toISOString() },
           { role: "assistant", content: fullResponse, timestamp: new Date().toISOString() },
         ];
 
@@ -247,6 +300,13 @@ Deno.serve(async (req: Request) => {
 
         if (upsertError) {
           console.error("Failed to persist chat session:", upsertError);
+          await logSecurityEvent(supabase, req, {
+            eventType: "ai_chat_session_persist_failed",
+            severity: "warning",
+            route: "ai-chat",
+            userId: user.id,
+            metadata: { mode, message: upsertError.message },
+          });
         }
       }
     };
@@ -263,7 +323,30 @@ Deno.serve(async (req: Request) => {
       },
     });
   } catch (error) {
+    if (error instanceof ValidationError) {
+      return new Response(JSON.stringify({ error: error.message }), {
+        status: error.status,
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      });
+    }
     console.error("ai-chat error:", error);
+    try {
+      const supabase = createClient(
+        Deno.env.get("SUPABASE_URL")!,
+        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+        { auth: { persistSession: false, autoRefreshToken: false } },
+      );
+      await logSecurityEvent(supabase, req, {
+        eventType: "ai_chat_internal_error",
+        severity: "critical",
+        route: "ai-chat",
+        metadata: {
+          message: error instanceof Error ? error.message : "Unknown error",
+        },
+      });
+    } catch {
+      // Ignore logging failures in the error path.
+    }
     return new Response(JSON.stringify({ error: "Internal server error" }), {
       status: 500,
       headers: { ...CORS_HEADERS, "Content-Type": "application/json" },

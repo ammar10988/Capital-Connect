@@ -12,6 +12,7 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import { supabase } from '../../lib/supabase';
 import { useAuthContext } from '../../context/AuthContext';
+import { sanitizeOptionalUrl, sanitizePlainText } from '../../lib/inputSecurity';
 
 const SECTORS = ['AI/ML','FinTech','HealthTech','SaaS','CleanTech','EdTech','AgriTech','DeepTech','Consumer','E-Commerce','Web3','Logistics','BioTech'];
 const STAGES = ['Pre-Seed','Seed','Series A','Series B','Series B+','Growth'];
@@ -117,18 +118,18 @@ export default function MyListingScreen() {
     try {
       const payload = {
         founder_id:       user.id,
-        company_name:     form.company_name.trim(),
-        tagline:          form.tagline.trim() || null,
-        website:          form.website.trim() || null,
+        company_name:     sanitizePlainText(form.company_name, { maxLength: 160 }),
+        tagline:          sanitizePlainText(form.tagline, { maxLength: 120 }) || null,
+        website:          sanitizeOptionalUrl(form.website, 'Website URL') || null,
         sector:           form.sector || null,
         stage:            form.stage || null,
-        description:      form.description.trim() || null,
+        description:      sanitizePlainText(form.description, { maxLength: 2000, multiline: true }) || null,
         arr_usd:          form.arr_usd ? Number(form.arr_usd) : null,
         growth_rate_pct:  form.growth_rate_pct ? Number(form.growth_rate_pct) : null,
         funding_ask_usd:  form.funding_ask_usd ? Number(form.funding_ask_usd) : null,
         team_size:        form.team_size ? Number(form.team_size) : null,
         founded_year:     form.founded_year ? Number(form.founded_year) : null,
-        use_of_funds:     form.use_of_funds.trim() || null,
+        use_of_funds:     sanitizePlainText(form.use_of_funds, { maxLength: 1500, multiline: true }) || null,
         status:           submitForReview ? 'submitted' : (applicationStatus === 'draft' ? 'draft' : applicationStatus),
         updated_at:       new Date().toISOString(),
         ...(submitForReview ? { submitted_at: new Date().toISOString() } : {}),

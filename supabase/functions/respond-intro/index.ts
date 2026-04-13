@@ -1,4 +1,13 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { enforceRateLimit } from "../_shared/abuseProtection.ts";
+import {
+  parseJsonObject,
+  requireEnum,
+  requireUuid,
+  sanitizeText,
+  ValidationError,
+} from "../_shared/inputValidation.ts";
+import { logSecurityEvent } from "../_shared/security.ts";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -7,6 +16,9 @@ const CORS_HEADERS = {
 };
 
 type IntroStatus = "accepted" | "declined" | "completed";
+const INTRO_RESPONSE_WINDOW_MS = 60 * 60 * 1000;
+const INTRO_RESPONSE_MAX_PER_USER = 40;
+const INTRO_RESPONSE_MAX_PER_IP = 80;
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -50,23 +62,22 @@ Deno.serve(async (req: Request) => {
 
     const { data: authData, error: authError } = await authClient.auth.getUser(token);
     if (authError || !authData.user) {
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "intro_response_unauthorized",
+        severity: "warning",
+        route: "respond-intro",
+      });
       return json({ error: "Unauthorized" }, 401);
     }
 
-    const { introId, status, declineReason } = await req.json() as {
-      introId: string;
-      status: IntroStatus;
-      declineReason?: string;
-    };
-
-    if (!introId || !status) {
-      return json({ error: "introId and status are required" }, 400);
-    }
-
-    const allowedStatuses: IntroStatus[] = ["accepted", "declined", "completed"];
-    if (!allowedStatuses.includes(status)) {
-      return json({ error: `status must be one of: ${allowedStatuses.join(", ")}` }, 400);
-    }
+    const body = await parseJsonObject(req);
+    const introId = requireUuid(body.introId, "introId");
+    const status = requireEnum(body.status, "status", ["accepted", "declined", "completed"] as const);
+    const declineReason = sanitizeText(body.declineReason, "declineReason", {
+      maxLength: 500,
+      multiline: true,
+      allowEmpty: true,
+    });
 
     const { data: actorProfile, error: actorError } = await serviceClient
       .from("profiles")
@@ -75,8 +86,23 @@ Deno.serve(async (req: Request) => {
       .single();
 
     if (actorError || !actorProfile || actorProfile.role !== "investor") {
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "intro_response_forbidden_role",
+        severity: "warning",
+        route: "respond-intro",
+        userId: authData.user.id,
+      });
       return json({ error: "Only investors can respond to intros" }, 403);
     }
+
+    await enforceRateLimit(serviceClient, req, {
+      route: "respond-intro",
+      windowMs: INTRO_RESPONSE_WINDOW_MS,
+      maxPerIp: INTRO_RESPONSE_MAX_PER_IP,
+      maxPerUser: INTRO_RESPONSE_MAX_PER_USER,
+      userId: authData.user.id,
+      eventType: "intro_response_rate_limited",
+    });
 
     const { data: introRow, error: introLookupError } = await serviceClient
       .from("introductions")
@@ -85,10 +111,24 @@ Deno.serve(async (req: Request) => {
       .single();
 
     if (introLookupError || !introRow) {
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "intro_response_not_found",
+        severity: "warning",
+        route: "respond-intro",
+        userId: authData.user.id,
+        metadata: { introId },
+      });
       return json({ error: "Introduction not found" }, 404);
     }
 
     if (introRow.investor_id !== authData.user.id) {
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "intro_response_ownership_failed",
+        severity: "warning",
+        route: "respond-intro",
+        userId: authData.user.id,
+        metadata: { introId, introInvestorId: introRow.investor_id },
+      });
       return json({ error: "You do not own this introduction" }, 403);
     }
 
@@ -97,7 +137,7 @@ Deno.serve(async (req: Request) => {
       responded_at: new Date().toISOString(),
     };
     if (status === "declined") {
-      updatePayload.decline_reason = declineReason?.trim() || null;
+      updatePayload.decline_reason = declineReason;
     }
 
     const { error: updateError } = await serviceClient
@@ -107,6 +147,13 @@ Deno.serve(async (req: Request) => {
       .eq("investor_id", authData.user.id);
 
     if (updateError) {
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "intro_response_update_failed",
+        severity: "critical",
+        route: "respond-intro",
+        userId: authData.user.id,
+        metadata: { introId, status, message: updateError.message },
+      });
       return json({ error: updateError.message }, 400);
     }
 
@@ -131,7 +178,7 @@ Deno.serve(async (req: Request) => {
           founder_id: introRow.founder_id,
           startup_id: introRow.startup_id,
           status,
-          decline_reason: declineReason?.trim() || null,
+          decline_reason: declineReason,
         },
       });
     }
@@ -150,13 +197,16 @@ Deno.serve(async (req: Request) => {
           founder_id: introRow.founder_id,
           startup_id: introRow.startup_id,
           status,
-          decline_reason: declineReason?.trim() || null,
+          decline_reason: declineReason,
         },
       }),
     }).catch((error) => console.error("send-email trigger error:", error));
 
     return json({ success: true });
   } catch (error) {
+    if (error instanceof ValidationError) {
+      return json({ error: error.message }, error.status);
+    }
     console.error("respond-intro error:", error);
     return json({ error: "Internal server error" }, 500);
   }

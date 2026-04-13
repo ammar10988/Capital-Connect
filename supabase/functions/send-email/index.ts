@@ -1,4 +1,14 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  escapeHtml,
+  parseJsonObject,
+  requireEmail,
+  requireEnum,
+  requireUuid,
+  sanitizeText,
+  ValidationError,
+} from "../_shared/inputValidation.ts";
+import { logSecurityEvent } from "../_shared/security.ts";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -70,9 +80,9 @@ function baseHtml(bodyContent: string): string {
 function buildTemplate(type: string, data: Record<string, unknown>): EmailTemplate {
   switch (type) {
     case "intro_request": {
-      const investorName = String(data.investor_name ?? "An investor");
-      const companyName = String(data.company_name ?? "your startup");
-      const message = data.message ? String(data.message) : null;
+      const investorName = escapeHtml(String(data.investor_name ?? "An investor"));
+      const companyName = escapeHtml(String(data.company_name ?? "your startup"));
+      const message = data.message ? escapeHtml(String(data.message)) : null;
       const introId = String(data.intro_id ?? "");
       return {
         subject: `Introduction Request from ${investorName} — ${companyName}`,
@@ -89,7 +99,7 @@ function buildTemplate(type: string, data: Record<string, unknown>): EmailTempla
     }
 
     case "intro_accepted": {
-      const companyName = String(data.company_name ?? "The startup");
+      const companyName = escapeHtml(String(data.company_name ?? "The startup"));
       const introId = String(data.intro_id ?? "");
       return {
         subject: `${companyName} accepted your introduction request`,
@@ -105,8 +115,8 @@ function buildTemplate(type: string, data: Record<string, unknown>): EmailTempla
     }
 
     case "intro_declined": {
-      const companyName = String(data.company_name ?? "The startup");
-      const declineReason = data.decline_reason ? String(data.decline_reason) : null;
+      const companyName = escapeHtml(String(data.company_name ?? "The startup"));
+      const declineReason = data.decline_reason ? escapeHtml(String(data.decline_reason)) : null;
       const introId = String(data.intro_id ?? "");
       return {
         subject: `${companyName} declined your introduction request`,
@@ -123,9 +133,9 @@ function buildTemplate(type: string, data: Record<string, unknown>): EmailTempla
     }
 
     case "application_status": {
-      const companyName = String(data.company_name ?? "Your startup");
-      const newStatus = String(data.status ?? "updated");
-      const adminNotes = data.admin_notes ? String(data.admin_notes) : null;
+      const companyName = escapeHtml(String(data.company_name ?? "Your startup"));
+      const newStatus = escapeHtml(String(data.status ?? "updated"));
+      const adminNotes = data.admin_notes ? escapeHtml(String(data.admin_notes)) : null;
       const isApproved = newStatus === "approved";
       return {
         subject: `Application Update: ${companyName} is ${newStatus}`,
@@ -145,8 +155,8 @@ function buildTemplate(type: string, data: Record<string, unknown>): EmailTempla
     }
 
     case "trust_badge_upgrade": {
-      const companyName = String(data.company_name ?? "Your startup");
-      const badgeName = String(data.badge_name ?? "Top Startup");
+      const companyName = escapeHtml(String(data.company_name ?? "Your startup"));
+      const badgeName = escapeHtml(String(data.badge_name ?? "Top Startup"));
       return {
         subject: `Your Trust Badge upgraded to "${badgeName}" — ${companyName}`,
         html: baseHtml(`
@@ -161,9 +171,9 @@ function buildTemplate(type: string, data: Record<string, unknown>): EmailTempla
     }
 
     case "event_rsvp": {
-      const eventTitle = String(data.event_title ?? "the event");
-      const eventDate = String(data.event_date ?? "");
-      const eventLocation = String(data.event_location ?? "");
+      const eventTitle = escapeHtml(String(data.event_title ?? "the event"));
+      const eventDate = escapeHtml(String(data.event_date ?? ""));
+      const eventLocation = escapeHtml(String(data.event_location ?? ""));
       const eventId = String(data.event_id ?? "");
       const isVirtual = Boolean(data.is_virtual);
       return {
@@ -208,24 +218,47 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
+    const serviceClient = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+      { auth: { persistSession: false, autoRefreshToken: false } },
+    );
+
     if (!isAuthorizedServiceCall(req)) {
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "email_send_unauthorized",
+        severity: "critical",
+        route: "send-email",
+      });
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
         status: 401,
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
       });
     }
 
-    const { to, type, data } = await req.json() as {
-      to: string | null;
-      type: string;
-      data: Record<string, unknown>;
-    };
+    const body = await parseJsonObject(req);
+    const type = requireEnum(body.type, "type", [
+      "intro_request",
+      "intro_accepted",
+      "intro_declined",
+      "application_status",
+      "trust_badge_upgrade",
+      "event_rsvp",
+    ] as const);
+    const to = body.to == null ? null : requireEmail(body.to, "to");
+    const data = typeof body.data === "object" && body.data !== null && !Array.isArray(body.data)
+      ? body.data as Record<string, unknown>
+      : {};
 
-    if (!type) {
-      return new Response(JSON.stringify({ error: "type is required" }), {
-        status: 400,
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
+    if (data.intro_id != null) requireUuid(data.intro_id, "data.intro_id");
+    if (data.founder_id != null) requireUuid(data.founder_id, "data.founder_id");
+    if (data.investor_id != null) requireUuid(data.investor_id, "data.investor_id");
+    if (data.user_id != null) requireUuid(data.user_id, "data.user_id");
+    if (data.message != null) {
+      data.message = sanitizeText(data.message, "data.message", { maxLength: 500, multiline: true });
+    }
+    if (data.decline_reason != null) {
+      data.decline_reason = sanitizeText(data.decline_reason, "data.decline_reason", { maxLength: 500, multiline: true });
     }
 
     // -----------------------------------------------------------------------
@@ -233,11 +266,6 @@ Deno.serve(async (req: Request) => {
     // -----------------------------------------------------------------------
     let recipientEmail = to;
     if (!recipientEmail) {
-      const supabase = createClient(
-        Deno.env.get("SUPABASE_URL")!,
-        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-      );
-
       // Determine which user ID to look up based on event type
       let lookupUserId: string | null = null;
       if (type === "intro_request" && data.founder_id) {
@@ -251,12 +279,18 @@ Deno.serve(async (req: Request) => {
       }
 
       if (lookupUserId) {
-        const { data: authUser } = await supabase.auth.admin.getUserById(lookupUserId);
+        const { data: authUser } = await serviceClient.auth.admin.getUserById(lookupUserId);
         recipientEmail = authUser?.user?.email ?? null;
       }
     }
 
     if (!recipientEmail) {
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "email_recipient_resolution_failed",
+        severity: "warning",
+        route: "send-email",
+        metadata: { type },
+      });
       return new Response(
         JSON.stringify({ error: "Could not determine recipient email address" }),
         { status: 400, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } },
@@ -291,6 +325,12 @@ Deno.serve(async (req: Request) => {
     if (!resendRes.ok) {
       const errText = await resendRes.text();
       console.error("Resend API error:", errText);
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "email_provider_error",
+        severity: "critical",
+        route: "send-email",
+        metadata: { type, status: resendRes.status, detail: errText.slice(0, 500) },
+      });
       return new Response(
         JSON.stringify({ error: "Email delivery failed", detail: errText }),
         { status: 502, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } },
@@ -303,7 +343,28 @@ Deno.serve(async (req: Request) => {
       { status: 200, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } },
     );
   } catch (err) {
+    if (err instanceof ValidationError) {
+      return new Response(
+        JSON.stringify({ error: err.message }),
+        { status: err.status, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } },
+      );
+    }
     console.error("send-email error:", err);
+    try {
+      const serviceClient = createClient(
+        Deno.env.get("SUPABASE_URL")!,
+        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+        { auth: { persistSession: false, autoRefreshToken: false } },
+      );
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "email_internal_error",
+        severity: "critical",
+        route: "send-email",
+        metadata: { message: err instanceof Error ? err.message : "Unknown error" },
+      });
+    } catch {
+      // Ignore nested logging failures.
+    }
     return new Response(
       JSON.stringify({ error: "Internal server error" }),
       { status: 500, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } },

@@ -1,4 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { isServiceRoleBearer } from "../_shared/abuseProtection.ts";
+import { logSecurityEvent } from "../_shared/security.ts";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -62,6 +64,18 @@ Deno.serve(async (req: Request) => {
   );
 
   try {
+    if (!isServiceRoleBearer(req)) {
+      await logSecurityEvent(supabase, req, {
+        eventType: "ingest_news_unauthorized",
+        severity: "critical",
+        route: "ingest-news",
+      });
+      return new Response(
+        JSON.stringify({ error: "Unauthorized" }),
+        { status: 401, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } },
+      );
+    }
+
     const newsApiKey = Deno.env.get("NEWS_API_KEY");
     if (!newsApiKey) {
       return new Response(

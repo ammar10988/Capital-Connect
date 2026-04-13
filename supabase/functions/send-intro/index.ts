@@ -1,10 +1,22 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { enforceRateLimit } from "../_shared/abuseProtection.ts";
+import {
+  parseJsonObject,
+  requireEnum,
+  requireUuid,
+  sanitizeText,
+  ValidationError,
+} from "../_shared/inputValidation.ts";
+import { logSecurityEvent } from "../_shared/security.ts";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
+const INTRO_REQUEST_WINDOW_MS = 60 * 60 * 1000;
+const INTRO_REQUEST_MAX_PER_USER = 20;
+const INTRO_REQUEST_MAX_PER_IP = 40;
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -48,34 +60,47 @@ Deno.serve(async (req: Request) => {
 
     const { data: authData, error: authError } = await authClient.auth.getUser(token);
     if (authError || !authData.user) {
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "intro_request_unauthorized",
+        severity: "warning",
+        route: "send-intro",
+      });
       return json({ error: "Unauthorized" }, 401);
     }
 
-    const {
-      investorId: rawInvestorId,
-      investor_id: legacyInvestorId,
-      startupId,
-      startup_id: legacyStartupId,
-      message,
-      connectorName,
-      connectorRole,
-      connectionType,
-    } = await req.json() as {
-      investorId?: string;
-      investor_id?: string;
-      startupId?: string;
-      startup_id?: string;
-      message?: string;
-      connectorName?: string;
-      connectorRole?: string;
-      connectionType?: "mutual" | "advisor" | "linkedin";
-    };
-
-    const investorId = (rawInvestorId ?? legacyInvestorId ?? "").replace(/^platform_/, "");
-    const normalizedStartupId = legacyStartupId ?? startupId ?? null;
+    const body = await parseJsonObject(req);
+    const rawInvestorId = typeof body.investorId === "string"
+      ? body.investorId
+      : typeof body.investor_id === "string"
+      ? body.investor_id
+      : "";
+    const investorId = rawInvestorId.startsWith("platform_")
+      ? rawInvestorId.replace(/^platform_/, "")
+      : rawInvestorId;
+    const normalizedStartupId = body.startup_id ?? body.startupId ?? null;
+    const message = sanitizeText(body.message, "message", {
+      maxLength: 500,
+      multiline: true,
+      allowEmpty: true,
+    });
+    const connectorName = sanitizeText(body.connectorName, "connectorName", {
+      maxLength: 120,
+      allowEmpty: true,
+    });
+    const connectorRole = sanitizeText(body.connectorRole, "connectorRole", {
+      maxLength: 120,
+      allowEmpty: true,
+    });
+    const connectionType = body.connectionType == null
+      ? null
+      : requireEnum(body.connectionType, "connectionType", ["mutual", "advisor", "linkedin"] as const);
 
     if (!investorId) {
       return json({ error: "investorId is required" }, 400);
+    }
+    requireUuid(investorId, "investorId");
+    if (normalizedStartupId != null) {
+      requireUuid(normalizedStartupId, "startupId");
     }
 
     const { data: requesterProfile, error: requesterError } = await serviceClient
@@ -85,12 +110,34 @@ Deno.serve(async (req: Request) => {
       .single();
 
     if (requesterError || !requesterProfile) {
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "intro_request_profile_missing",
+        severity: "warning",
+        route: "send-intro",
+        userId: authData.user.id,
+      });
       return json({ error: "Requester profile not found" }, 403);
     }
 
     if (requesterProfile.role !== "founder") {
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "intro_request_forbidden_role",
+        severity: "warning",
+        route: "send-intro",
+        userId: authData.user.id,
+        metadata: { role: requesterProfile.role },
+      });
       return json({ error: "Only founders can send intro requests" }, 403);
     }
+
+    await enforceRateLimit(serviceClient, req, {
+      route: "send-intro",
+      windowMs: INTRO_REQUEST_WINDOW_MS,
+      maxPerIp: INTRO_REQUEST_MAX_PER_IP,
+      maxPerUser: INTRO_REQUEST_MAX_PER_USER,
+      userId: authData.user.id,
+      eventType: "intro_request_rate_limited",
+    });
 
     if (normalizedStartupId) {
       const { data: startupOwner, error: startupError } = await serviceClient
@@ -101,6 +148,13 @@ Deno.serve(async (req: Request) => {
         .single();
 
       if (startupError || !startupOwner) {
+        await logSecurityEvent(serviceClient, req, {
+          eventType: "intro_request_startup_ownership_failed",
+          severity: "warning",
+          route: "send-intro",
+          userId: authData.user.id,
+          metadata: { startupId: normalizedStartupId },
+        });
         return json({ error: "You do not own the startup linked to this request" }, 403);
       }
     }
@@ -112,16 +166,23 @@ Deno.serve(async (req: Request) => {
       .single();
 
     if (investorError || !targetInvestor || targetInvestor.role !== "investor") {
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "intro_request_target_not_found",
+        severity: "warning",
+        route: "send-intro",
+        userId: authData.user.id,
+        metadata: { investorId },
+      });
       return json({ error: "Investor not found" }, 404);
     }
 
     const introInsert: Record<string, unknown> = {
       investor_id: investorId,
       founder_id: authData.user.id,
-      message: message?.trim() || null,
-      connector_name: connectorName ?? null,
-      connector_role: connectorRole ?? null,
-      connection_type: connectionType ?? null,
+      message,
+      connector_name: connectorName,
+      connector_role: connectorRole,
+      connection_type: connectionType,
       status: "pending",
     };
 
@@ -136,6 +197,13 @@ Deno.serve(async (req: Request) => {
       .single();
 
     if (introError || !intro) {
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "intro_request_insert_failed",
+        severity: "critical",
+        route: "send-intro",
+        userId: authData.user.id,
+        metadata: { investorId, message: introError?.message ?? "unknown" },
+      });
       return json({ error: introError?.message ?? "Failed to create introduction" }, 409);
     }
 
@@ -158,7 +226,7 @@ Deno.serve(async (req: Request) => {
       user_id: investorId,
       type: "intro_request",
       title: `New intro request from ${founderName}`,
-      body: message?.trim() || `A founder wants to connect about ${companyName}.`,
+      body: message || `A founder wants to connect about ${companyName}.`,
       action_url: "/dashboard/introductions",
       payload: {
         intro_id: intro.id,
@@ -183,7 +251,7 @@ Deno.serve(async (req: Request) => {
           intro_id: intro.id,
           founder_name: founderName,
           company_name: companyName,
-          message: message?.trim() ?? "",
+          message: message ?? "",
           investor_id: investorId,
         },
       }),
@@ -191,6 +259,9 @@ Deno.serve(async (req: Request) => {
 
     return json({ success: true, introId: intro.id });
   } catch (error) {
+    if (error instanceof ValidationError) {
+      return json({ error: error.message }, error.status);
+    }
     console.error("send-intro error:", error);
     return json({ error: "Internal server error" }, 500);
   }

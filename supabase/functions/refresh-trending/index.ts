@@ -1,4 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { isServiceRoleBearer } from "../_shared/abuseProtection.ts";
+import { logSecurityEvent } from "../_shared/security.ts";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -38,6 +40,18 @@ Deno.serve(async (req: Request) => {
   );
 
   try {
+    if (!isServiceRoleBearer(req)) {
+      await logSecurityEvent(supabase, req, {
+        eventType: "refresh_trending_unauthorized",
+        severity: "critical",
+        route: "refresh-trending",
+      });
+      return new Response(
+        JSON.stringify({ error: "Unauthorized" }),
+        { status: 401, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } },
+      );
+    }
+
     const now = new Date();
     const ago7d  = new Date(now.getTime() - 7  * 24 * 60 * 60 * 1000).toISOString();
     const ago30d = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();

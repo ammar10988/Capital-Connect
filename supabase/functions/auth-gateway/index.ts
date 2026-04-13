@@ -1,4 +1,15 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { enforceRateLimit } from "../_shared/abuseProtection.ts";
+import {
+  parseJsonObject,
+  requireEmail,
+  requireEnum,
+  requireOptionalHttpUrl,
+  sanitizeMetadata,
+  sanitizeText,
+  ValidationError,
+} from "../_shared/inputValidation.ts";
+import { getRequestIp, logSecurityEvent, sha256Hex } from "../_shared/security.ts";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -15,6 +26,9 @@ const SIGNUP_MAX_PER_IDENTIFIER = 3;
 const SIGNUP_MAX_PER_IP = 10;
 const RESET_MAX_PER_IDENTIFIER = 3;
 const RESET_MAX_PER_IP = 10;
+const VERIFY_WINDOW_MS = 15 * 60 * 1000;
+const VERIFY_MAX_PER_IDENTIFIER = 10;
+const VERIFY_MAX_PER_IP = 30;
 const PASSWORD_MIN_LENGTH = 12;
 
 type Action = "login" | "register" | "request_password_reset" | "verify_password";
@@ -44,29 +58,6 @@ function validatePassword(password: string) {
   if (!/[0-9]/.test(password)) return "Include at least one number";
   if (!/[^A-Za-z0-9]/.test(password)) return "Include at least one symbol";
   return null;
-}
-
-function normalizeEmail(email: string) {
-  return email.trim().toLowerCase();
-}
-
-function getIpAddress(req: Request) {
-  const forwardedFor = req.headers.get("x-forwarded-for");
-  if (forwardedFor) {
-    return forwardedFor.split(",")[0]?.trim() ?? null;
-  }
-
-  return req.headers.get("cf-connecting-ip")
-    ?? req.headers.get("x-real-ip")
-    ?? null;
-}
-
-async function sha256Hex(value: string) {
-  const bytes = new TextEncoder().encode(value);
-  const hash = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(hash))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
 }
 
 function getAllowedRedirects() {
@@ -139,7 +130,7 @@ async function recordAttempt(
   });
 }
 
-async function enforceRateLimit(
+async function enforceFailedAttemptRateLimit(
   serviceClient: ReturnType<typeof createClient>,
   input: {
     action: string;
@@ -192,21 +183,35 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const body = await req.json() as RequestBody;
-    const action = body.action;
-    const email = body.email ? normalizeEmail(body.email) : "";
-    const password = body.password ?? "";
-    const redirectTo = body.redirectTo;
-
-    if (!action || !email) {
-      return json({ error: "action and email are required" }, 400);
-    }
+    const rawBody = await parseJsonObject(req);
+    const action = requireEnum(rawBody.action, "action", [
+      "login",
+      "register",
+      "request_password_reset",
+      "verify_password",
+    ] as const);
+    const email = requireEmail(rawBody.email, "email");
+    const password = sanitizeText(rawBody.password, "password", {
+      maxLength: 200,
+      allowEmpty: true,
+    }) ?? "";
+    const redirectTo = requireOptionalHttpUrl(rawBody.redirectTo, "redirectTo");
 
     if (redirectTo && !isAllowedRedirect(redirectTo)) {
+      const auditClient = createClient(supabaseUrl, serviceRoleKey, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
+      await logSecurityEvent(auditClient, req, {
+        eventType: "auth_invalid_redirect",
+        severity: "warning",
+        route: "auth-gateway",
+        identifier: email,
+        metadata: { action, redirectTo },
+      });
       return json({ error: "Invalid redirect target" }, 400);
     }
 
-    const ipAddress = getIpAddress(req);
+    const ipAddress = getRequestIp(req);
     const identifierHash = await sha256Hex(email);
     const ipHash = ipAddress ? await sha256Hex(ipAddress) : null;
 
@@ -220,7 +225,15 @@ Deno.serve(async (req: Request) => {
     if (action === "login") {
       if (!password) return json({ error: "password is required" }, 400);
 
-      await enforceRateLimit(serviceClient, {
+      await enforceRateLimit(serviceClient, req, {
+        route: `auth-gateway:${action}`,
+        windowMs: LOGIN_WINDOW_MS,
+        maxPerIdentifier: LOGIN_MAX_PER_IDENTIFIER,
+        maxPerIp: LOGIN_MAX_PER_IP,
+        identifier: email,
+        eventType: "auth_rate_limit_exceeded",
+      });
+      await enforceFailedAttemptRateLimit(serviceClient, {
         action,
         identifierHash,
         ipHash,
@@ -237,6 +250,13 @@ Deno.serve(async (req: Request) => {
           ipHash,
           success: false,
         });
+        await logSecurityEvent(serviceClient, req, {
+          eventType: "auth_login_failed",
+          severity: "warning",
+          route: "auth-gateway",
+          identifier: email,
+          metadata: { action },
+        });
         return json({ error: "Invalid email or password" }, 401);
       }
 
@@ -247,6 +267,14 @@ Deno.serve(async (req: Request) => {
           ipHash,
           success: false,
           metadata: { reason: "email_not_verified" },
+        });
+        await logSecurityEvent(serviceClient, req, {
+          eventType: "auth_email_not_verified",
+          severity: "warning",
+          route: "auth-gateway",
+          userId: data.user.id,
+          identifier: email,
+          metadata: { action },
         });
         return json({
           error: "Verify your email before signing in",
@@ -259,6 +287,14 @@ Deno.serve(async (req: Request) => {
         identifierHash,
         ipHash,
         success: true,
+      });
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "auth_login_succeeded",
+        severity: "info",
+        route: "auth-gateway",
+        userId: data.user.id,
+        identifier: email,
+        metadata: { action },
       });
 
       return json({
@@ -274,7 +310,15 @@ Deno.serve(async (req: Request) => {
       const passwordError = validatePassword(password);
       if (passwordError) return json({ error: passwordError }, 400);
 
-      await enforceRateLimit(serviceClient, {
+      await enforceRateLimit(serviceClient, req, {
+        route: `auth-gateway:${action}`,
+        windowMs: SIGNUP_WINDOW_MS,
+        maxPerIdentifier: SIGNUP_MAX_PER_IDENTIFIER,
+        maxPerIp: SIGNUP_MAX_PER_IP,
+        identifier: email,
+        eventType: "auth_rate_limit_exceeded",
+      });
+      await enforceFailedAttemptRateLimit(serviceClient, {
         action,
         identifierHash,
         ipHash,
@@ -287,7 +331,7 @@ Deno.serve(async (req: Request) => {
         email,
         password,
         options: {
-          data: body.data ?? {},
+          data: sanitizeMetadata(rawBody.data),
           emailRedirectTo: redirectTo,
         },
       });
@@ -300,14 +344,36 @@ Deno.serve(async (req: Request) => {
       });
 
       if (error) {
+        await logSecurityEvent(serviceClient, req, {
+          eventType: "auth_register_failed",
+          severity: "warning",
+          route: "auth-gateway",
+          identifier: email,
+          metadata: { action, message: error.message },
+        });
         return json({ error: error.message }, 400);
       }
 
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "auth_register_succeeded",
+        severity: "info",
+        route: "auth-gateway",
+        identifier: email,
+        metadata: { action },
+      });
       return json({ success: true });
     }
 
     if (action === "request_password_reset") {
-      await enforceRateLimit(serviceClient, {
+      await enforceRateLimit(serviceClient, req, {
+        route: `auth-gateway:${action}`,
+        windowMs: RESET_WINDOW_MS,
+        maxPerIdentifier: RESET_MAX_PER_IDENTIFIER,
+        maxPerIp: RESET_MAX_PER_IP,
+        identifier: email,
+        eventType: "auth_rate_limit_exceeded",
+      });
+      await enforceFailedAttemptRateLimit(serviceClient, {
         action,
         identifierHash,
         ipHash,
@@ -328,20 +394,65 @@ Deno.serve(async (req: Request) => {
       });
 
       if (error) {
+        await logSecurityEvent(serviceClient, req, {
+          eventType: "auth_password_reset_failed",
+          severity: "warning",
+          route: "auth-gateway",
+          identifier: email,
+          metadata: { action, message: error.message },
+        });
         return json({ error: error.message }, 400);
       }
 
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "auth_password_reset_requested",
+        severity: "info",
+        route: "auth-gateway",
+        identifier: email,
+        metadata: { action },
+      });
       return json({ success: true });
     }
 
     if (action === "verify_password") {
       if (!password) return json({ error: "password is required" }, 400);
 
+      await enforceRateLimit(serviceClient, req, {
+        route: `auth-gateway:${action}`,
+        windowMs: VERIFY_WINDOW_MS,
+        maxPerIdentifier: VERIFY_MAX_PER_IDENTIFIER,
+        maxPerIp: VERIFY_MAX_PER_IP,
+        identifier: email,
+        eventType: "auth_rate_limit_exceeded",
+      });
+      await enforceFailedAttemptRateLimit(serviceClient, {
+        action,
+        identifierHash,
+        ipHash,
+        windowMs: VERIFY_WINDOW_MS,
+        maxPerIdentifier: VERIFY_MAX_PER_IDENTIFIER,
+        maxPerIp: VERIFY_MAX_PER_IP,
+      });
+
       const { error } = await anonClient.auth.signInWithPassword({ email, password });
       if (error) {
+        await logSecurityEvent(serviceClient, req, {
+          eventType: "auth_password_verify_failed",
+          severity: "warning",
+          route: "auth-gateway",
+          identifier: email,
+          metadata: { action, message: error.message },
+        });
         return json({ error: "Current password is incorrect" }, 401);
       }
 
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "auth_password_verified",
+        severity: "info",
+        route: "auth-gateway",
+        identifier: email,
+        metadata: { action },
+      });
       return json({ success: true });
     }
 
@@ -350,8 +461,26 @@ Deno.serve(async (req: Request) => {
     if (error instanceof Response) {
       return error;
     }
+    if (error instanceof ValidationError) {
+      return json({ error: error.message }, error.status);
+    }
 
     console.error("auth-gateway error:", error);
+    try {
+      const auditClient = createClient(supabaseUrl, serviceRoleKey, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
+      await logSecurityEvent(auditClient, req, {
+        eventType: "auth_gateway_error",
+        severity: "critical",
+        route: "auth-gateway",
+        metadata: {
+          message: error instanceof Error ? error.message : "Unknown error",
+        },
+      });
+    } catch {
+      // Ignore secondary logging errors.
+    }
     return json({ error: "Internal server error" }, 500);
   }
 });
