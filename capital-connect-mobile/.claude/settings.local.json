@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(ls \"D:/Garage AI Workspace/capital-connect/capital-connect-mobile/app/\\(app\\)/\")",
+      "Bash(find 'D:\\\\Garage AI Workspace\\\\capital-connect\\\\capital-connect-web\\\\src' -type f -iname *startup*)",
+      "Bash(find:*)",
+      "Bash(ls -la 'D:\\\\Garage AI Workspace\\\\capital-connect\\\\capital-connect-mobile\\\\app\\\\\\(app\\)\\\\browse')",
+      "Bash(ls -la 'D:\\\\Garage AI Workspace\\\\capital-connect\\\\capital-connect-mobile\\\\app\\\\\\(app\\)')",
+      "Bash(grep -r browse/[id] 'D:\\\\Garage AI Workspace\\\\capital-connect\\\\capital-connect-mobile\\\\app')",
+      "Bash(grep -r onPress.*browse 'D:\\\\Garage AI Workspace\\\\capital-connect\\\\capital-connect-web\\\\src')",
+      "Bash(npx expo:*)",
+      "Bash(npx tsc:*)"
+    ]
+  }
+}
