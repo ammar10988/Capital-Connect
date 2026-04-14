@@ -6,6 +6,7 @@ import {
   sanitizeText,
   ValidationError,
 } from "../_shared/inputValidation.ts";
+import { fetchWithTimeout } from "../_shared/fetchWithTimeout.ts";
 import { logSecurityEvent } from "../_shared/security.ts";
 
 const CORS_HEADERS = {
@@ -129,12 +130,29 @@ Deno.serve(async (req: Request) => {
 
     const supabase = createClient(supabaseUrl, serviceRoleKey);
 
-    const { data: profile, error: profileError } = await supabase
-      .from("profiles")
-      .select("role")
-      .eq("id", user.id)
-      .maybeSingle();
+    const [profileResult, sessionResult] = await Promise.all([
+      supabase
+        .from("profiles")
+        .select("role")
+        .eq("id", user.id)
+        .maybeSingle(),
+      supabase
+        .from("chat_sessions")
+        .select("messages")
+        .eq("user_id", user.id)
+        .eq("mode", mode)
+        .maybeSingle(),
+      enforceRateLimit(supabase, req, {
+        route: "ai-chat",
+        windowMs: AI_CHAT_WINDOW_MS,
+        maxPerIp: AI_CHAT_MAX_PER_IP,
+        maxPerUser: AI_CHAT_MAX_PER_USER,
+        userId: user.id,
+        eventType: "ai_chat_rate_limited",
+      }),
+    ]);
 
+    const { data: profile, error: profileError } = profileResult;
     if (profileError) {
       console.error("Failed to load profile for chat:", profileError);
       await logSecurityEvent(supabase, req, {
@@ -151,23 +169,7 @@ Deno.serve(async (req: Request) => {
     }
 
     const role = profile?.role === "investor" ? "investor" : "founder";
-
-    await enforceRateLimit(supabase, req, {
-      route: "ai-chat",
-      windowMs: AI_CHAT_WINDOW_MS,
-      maxPerIp: AI_CHAT_MAX_PER_IP,
-      maxPerUser: AI_CHAT_MAX_PER_USER,
-      userId: user.id,
-      eventType: "ai_chat_rate_limited",
-    });
-
-    const { data: session, error: sessionError } = await supabase
-      .from("chat_sessions")
-      .select("messages")
-      .eq("user_id", user.id)
-      .eq("mode", mode)
-      .maybeSingle();
-
+    const { data: session, error: sessionError } = sessionResult;
     if (sessionError) {
       console.error("Failed to load chat session:", sessionError);
       await logSecurityEvent(supabase, req, {
@@ -212,7 +214,7 @@ Deno.serve(async (req: Request) => {
     const geminiUrl =
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent?alt=sse&key=${geminiApiKey}`;
 
-    const geminiRes = await fetch(geminiUrl, {
+    const geminiRes = await fetchWithTimeout(geminiUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(geminiPayload),

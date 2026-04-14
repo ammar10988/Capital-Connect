@@ -9,7 +9,12 @@ import {
   sanitizeText,
   ValidationError,
 } from "../_shared/inputValidation.ts";
-import { getRequestIp, logSecurityEvent, sha256Hex } from "../_shared/security.ts";
+import {
+  getRequestIp,
+  getSafeErrorSummary,
+  logSecurityEvent,
+  sha256Hex,
+} from "../_shared/security.ts";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -132,8 +137,10 @@ async function recordAttempt(
 
 async function enforceFailedAttemptRateLimit(
   serviceClient: ReturnType<typeof createClient>,
+  req: Request,
   input: {
     action: string;
+    identifier: string;
     identifierHash: string;
     ipHash: string | null;
     windowMs: number;
@@ -150,6 +157,20 @@ async function enforceFailedAttemptRateLimit(
   );
 
   if (counts.identifierCount >= input.maxPerIdentifier || counts.ipCount >= input.maxPerIp) {
+    await logSecurityEvent(serviceClient, req, {
+      eventType: "auth_failed_attempt_lockout",
+      severity: "warning",
+      route: "auth-gateway",
+      identifier: input.identifier,
+      metadata: {
+        action: input.action,
+        window_ms: input.windowMs,
+        identifier_count: counts.identifierCount,
+        ip_count: counts.ipCount,
+        max_per_identifier: input.maxPerIdentifier,
+        max_per_ip: input.maxPerIp,
+      },
+    });
     const retryAfterSeconds = Math.ceil(input.windowMs / 1000);
     throw new Response(
       JSON.stringify({
@@ -233,8 +254,9 @@ Deno.serve(async (req: Request) => {
         identifier: email,
         eventType: "auth_rate_limit_exceeded",
       });
-      await enforceFailedAttemptRateLimit(serviceClient, {
+      await enforceFailedAttemptRateLimit(serviceClient, req, {
         action,
+        identifier: email,
         identifierHash,
         ipHash,
         windowMs: LOGIN_WINDOW_MS,
@@ -318,8 +340,9 @@ Deno.serve(async (req: Request) => {
         identifier: email,
         eventType: "auth_rate_limit_exceeded",
       });
-      await enforceFailedAttemptRateLimit(serviceClient, {
+      await enforceFailedAttemptRateLimit(serviceClient, req, {
         action,
+        identifier: email,
         identifierHash,
         ipHash,
         windowMs: SIGNUP_WINDOW_MS,
@@ -373,8 +396,9 @@ Deno.serve(async (req: Request) => {
         identifier: email,
         eventType: "auth_rate_limit_exceeded",
       });
-      await enforceFailedAttemptRateLimit(serviceClient, {
+      await enforceFailedAttemptRateLimit(serviceClient, req, {
         action,
+        identifier: email,
         identifierHash,
         ipHash,
         windowMs: RESET_WINDOW_MS,
@@ -425,8 +449,9 @@ Deno.serve(async (req: Request) => {
         identifier: email,
         eventType: "auth_rate_limit_exceeded",
       });
-      await enforceFailedAttemptRateLimit(serviceClient, {
+      await enforceFailedAttemptRateLimit(serviceClient, req, {
         action,
+        identifier: email,
         identifierHash,
         ipHash,
         windowMs: VERIFY_WINDOW_MS,
@@ -465,7 +490,7 @@ Deno.serve(async (req: Request) => {
       return json({ error: error.message }, error.status);
     }
 
-    console.error("auth-gateway error:", error);
+    console.error("auth-gateway error:", getSafeErrorSummary(error));
     try {
       const auditClient = createClient(supabaseUrl, serviceRoleKey, {
         auth: { persistSession: false, autoRefreshToken: false },
@@ -475,7 +500,7 @@ Deno.serve(async (req: Request) => {
         severity: "critical",
         route: "auth-gateway",
         metadata: {
-          message: error instanceof Error ? error.message : "Unknown error",
+          ...getSafeErrorSummary(error),
         },
       });
     } catch {

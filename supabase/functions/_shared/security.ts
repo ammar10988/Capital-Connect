@@ -30,6 +30,27 @@ export async function sha256Hex(value: string) {
     .join("");
 }
 
+export function getSafeErrorSummary(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+    };
+  }
+
+  if (typeof error === "string") {
+    return {
+      name: "Error",
+      message: error,
+    };
+  }
+
+  return {
+    name: "UnknownError",
+    message: "Unknown error",
+  };
+}
+
 export async function logSecurityEvent(
   serviceClient: SupabaseClient,
   req: Request,
@@ -51,6 +72,6 @@ export async function logSecurityEvent(
       metadata: input.metadata ?? {},
     });
   } catch (error) {
-    console.error("security log error:", error);
+    console.error("security log error:", getSafeErrorSummary(error));
   }
 }

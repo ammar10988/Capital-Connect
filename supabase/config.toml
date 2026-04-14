@@ -5,6 +5,7 @@ enabled = true
 site_url = "http://localhost:5173"
 additional_redirect_urls = [
   "http://localhost:5173/auth/verify-email",
+  "http://localhost:5173/auth/callback",
   "http://localhost:5173/auth/reset-password",
   "capitalconnect://verify-email",
   "capitalconnect://reset-password",
@@ -17,5 +18,5 @@ refresh_token_reuse_interval = 10
 enable_confirmations = true
 double_confirm_changes = true
 secure_password_change = true
-max_frequency = "5m"
-otp_expiry = 1800
+max_frequency = "60s"
+otp_expiry = 3600

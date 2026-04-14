@@ -7,6 +7,7 @@ import {
   sanitizeText,
   ValidationError,
 } from "../_shared/inputValidation.ts";
+import { fetchWithTimeout } from "../_shared/fetchWithTimeout.ts";
 import { logSecurityEvent } from "../_shared/security.ts";
 
 const CORS_HEADERS = {
@@ -58,7 +59,11 @@ Deno.serve(async (req: Request) => {
       auth: { persistSession: false, autoRefreshToken: false },
     });
 
-    const { data: authData, error: authError } = await authClient.auth.getUser(token);
+    const [authResult, body] = await Promise.all([
+      authClient.auth.getUser(token),
+      parseJsonObject(req),
+    ]);
+    const { data: authData, error: authError } = authResult;
     if (authError || !authData.user) {
       await logSecurityEvent(serviceClient, req, {
         eventType: "intro_request_unauthorized",
@@ -68,7 +73,6 @@ Deno.serve(async (req: Request) => {
       return json({ error: "Unauthorized" }, 401);
     }
 
-    const body = await parseJsonObject(req);
     const rawInvestorId = typeof body.investorId === "string"
       ? body.investorId
       : typeof body.investor_id === "string"
@@ -139,31 +143,36 @@ Deno.serve(async (req: Request) => {
       eventType: "intro_request_rate_limited",
     });
 
-    if (normalizedStartupId) {
-      const { data: startupOwner, error: startupError } = await serviceClient
-        .from("startup_applications")
-        .select("id")
-        .eq("id", normalizedStartupId)
-        .eq("founder_id", authData.user.id)
-        .single();
+    const [startupResult, investorResult] = await Promise.all([
+      normalizedStartupId
+        ? serviceClient
+          .from("startup_applications")
+          .select("id, company_name")
+          .eq("id", normalizedStartupId)
+          .eq("founder_id", authData.user.id)
+          .single()
+        : Promise.resolve({ data: null, error: null }),
+      serviceClient
+        .from("profiles")
+        .select("id, role")
+        .eq("id", investorId)
+        .single(),
+    ]);
 
-      if (startupError || !startupOwner) {
-        await logSecurityEvent(serviceClient, req, {
-          eventType: "intro_request_startup_ownership_failed",
-          severity: "warning",
-          route: "send-intro",
-          userId: authData.user.id,
-          metadata: { startupId: normalizedStartupId },
-        });
-        return json({ error: "You do not own the startup linked to this request" }, 403);
-      }
+    const startupOwner = startupResult.data;
+    const startupError = startupResult.error;
+    if (normalizedStartupId && (startupError || !startupOwner)) {
+      await logSecurityEvent(serviceClient, req, {
+        eventType: "intro_request_startup_ownership_failed",
+        severity: "warning",
+        route: "send-intro",
+        userId: authData.user.id,
+        metadata: { startupId: normalizedStartupId },
+      });
+      return json({ error: "You do not own the startup linked to this request" }, 403);
     }
 
-    const { data: targetInvestor, error: investorError } = await serviceClient
-      .from("profiles")
-      .select("id, role")
-      .eq("id", investorId)
-      .single();
+    const { data: targetInvestor, error: investorError } = investorResult;
 
     if (investorError || !targetInvestor || targetInvestor.role !== "investor") {
       await logSecurityEvent(serviceClient, req, {
@@ -207,15 +216,7 @@ Deno.serve(async (req: Request) => {
       return json({ error: introError?.message ?? "Failed to create introduction" }, 409);
     }
 
-    let companyName = requesterProfile.company ?? "a founder";
-    if (normalizedStartupId) {
-      const { data: startup } = await serviceClient
-        .from("startup_applications")
-        .select("company_name")
-        .eq("id", normalizedStartupId)
-        .single();
-      companyName = startup?.company_name ?? companyName;
-    }
+    const companyName = startupOwner?.company_name ?? requesterProfile.company ?? "a founder";
 
     const founderName =
       `${requesterProfile.first_name ?? ""} ${requesterProfile.last_name ?? ""}`.trim()
@@ -238,7 +239,7 @@ Deno.serve(async (req: Request) => {
     });
 
     const supabaseUrlForEmail = Deno.env.get("SUPABASE_URL")!;
-    fetch(`${supabaseUrlForEmail}/functions/v1/send-email`, {
+    fetchWithTimeout(`${supabaseUrlForEmail}/functions/v1/send-email`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -255,7 +256,7 @@ Deno.serve(async (req: Request) => {
           investor_id: investorId,
         },
       }),
-    }).catch((error) => console.error("send-email trigger error:", error));
+    }).catch((error) => console.error("send-email trigger error:", error instanceof Error ? error.message : error));
 
     return json({ success: true, introId: intro.id });
   } catch (error) {

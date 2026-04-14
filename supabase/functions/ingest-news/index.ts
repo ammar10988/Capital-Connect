@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { isServiceRoleBearer } from "../_shared/abuseProtection.ts";
+import { fetchWithTimeout } from "../_shared/fetchWithTimeout.ts";
 import { logSecurityEvent } from "../_shared/security.ts";
 
 const CORS_HEADERS = {
@@ -99,7 +100,7 @@ Deno.serve(async (req: Request) => {
     newsUrl.searchParams.set("from", fromStr);
     newsUrl.searchParams.set("apiKey", newsApiKey);
 
-    const newsRes = await fetch(newsUrl.toString());
+    const newsRes = await fetchWithTimeout(newsUrl.toString());
     if (!newsRes.ok) {
       const errText = await newsRes.text();
       console.error("NewsAPI error:", errText);

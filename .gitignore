@@ -1,3 +1,9 @@
 .claude/settings.local.json
 scripts/**/.env
 supabase/.temp/
+.env
+.env.*
+!.env.example
+capital-connect-web/.env
+capital-connect-web/.env.*
+!capital-connect-web/.env.example

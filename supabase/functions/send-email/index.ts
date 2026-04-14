@@ -8,6 +8,7 @@ import {
   sanitizeText,
   ValidationError,
 } from "../_shared/inputValidation.ts";
+import { fetchWithTimeout } from "../_shared/fetchWithTimeout.ts";
 import { logSecurityEvent } from "../_shared/security.ts";
 
 const CORS_HEADERS = {
@@ -193,6 +194,31 @@ function buildTemplate(type: string, data: Record<string, unknown>): EmailTempla
       };
     }
 
+    case "support_contact": {
+      const ticketId = escapeHtml(String(data.ticket_id ?? ""));
+      const name = escapeHtml(String(data.name ?? "Unknown"));
+      const email = escapeHtml(String(data.email ?? "Unknown"));
+      const subject = escapeHtml(String(data.subject ?? "General Inquiry"));
+      const message = escapeHtml(String(data.message ?? ""));
+      const userId = escapeHtml(String(data.user_id ?? "Unknown"));
+      return {
+        subject: `New support ticket: ${subject}`,
+        html: baseHtml(`
+          <h2>New Support Ticket <span class="badge badge-info">${subject}</span></h2>
+          <p>A new support request has been submitted from the Capital Connect app.</p>
+          <table style="width:100%; border-collapse:collapse; margin:20px 0;">
+            <tr><td style="color:#6b7280; padding:8px 0; font-size:14px; width:120px;">Ticket ID</td><td style="color:#e2e8f0; font-size:14px;">${ticketId}</td></tr>
+            <tr><td style="color:#6b7280; padding:8px 0; font-size:14px;">User ID</td><td style="color:#e2e8f0; font-size:14px;">${userId}</td></tr>
+            <tr><td style="color:#6b7280; padding:8px 0; font-size:14px;">Name</td><td style="color:#e2e8f0; font-size:14px;">${name}</td></tr>
+            <tr><td style="color:#6b7280; padding:8px 0; font-size:14px;">Email</td><td style="color:#e2e8f0; font-size:14px;">${email}</td></tr>
+          </table>
+          <div class="highlight">${message.replaceAll("\n", "<br />")}</div>
+          <a href="${APP_URL}/support/contact" class="cta">Open Support Inbox</a>
+        `),
+        text: `New support ticket\n\nTicket ID: ${ticketId}\nUser ID: ${userId}\nName: ${name}\nEmail: ${email}\nSubject: ${subject}\n\nMessage:\n${String(data.message ?? "")}`,
+      };
+    }
+
     default:
       return {
         subject: "InvestLigence Notification",
@@ -244,6 +270,7 @@ Deno.serve(async (req: Request) => {
       "application_status",
       "trust_badge_upgrade",
       "event_rsvp",
+      "support_contact",
     ] as const);
     const to = body.to == null ? null : requireEmail(body.to, "to");
     const data = typeof body.data === "object" && body.data !== null && !Array.isArray(body.data)
@@ -307,7 +334,7 @@ Deno.serve(async (req: Request) => {
     // -----------------------------------------------------------------------
     const resendApiKey = Deno.env.get("RESEND_API_KEY")!;
 
-    const resendRes = await fetch("https://api.resend.com/emails", {
+    const resendRes = await fetchWithTimeout("https://api.resend.com/emails", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${resendApiKey}`,

@@ -7,6 +7,7 @@ import {
   sanitizeText,
   ValidationError,
 } from "../_shared/inputValidation.ts";
+import { fetchWithTimeout } from "../_shared/fetchWithTimeout.ts";
 import { logSecurityEvent } from "../_shared/security.ts";
 
 const CORS_HEADERS = {
@@ -60,7 +61,11 @@ Deno.serve(async (req: Request) => {
       auth: { persistSession: false, autoRefreshToken: false },
     });
 
-    const { data: authData, error: authError } = await authClient.auth.getUser(token);
+    const [authResult, body] = await Promise.all([
+      authClient.auth.getUser(token),
+      parseJsonObject(req),
+    ]);
+    const { data: authData, error: authError } = authResult;
     if (authError || !authData.user) {
       await logSecurityEvent(serviceClient, req, {
         eventType: "intro_response_unauthorized",
@@ -70,7 +75,6 @@ Deno.serve(async (req: Request) => {
       return json({ error: "Unauthorized" }, 401);
     }
 
-    const body = await parseJsonObject(req);
     const introId = requireUuid(body.introId, "introId");
     const status = requireEnum(body.status, "status", ["accepted", "declined", "completed"] as const);
     const declineReason = sanitizeText(body.declineReason, "declineReason", {
@@ -183,7 +187,7 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    fetch(`${supabaseUrl}/functions/v1/send-email`, {
+    fetchWithTimeout(`${supabaseUrl}/functions/v1/send-email`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -200,7 +204,7 @@ Deno.serve(async (req: Request) => {
           decline_reason: declineReason,
         },
       }),
-    }).catch((error) => console.error("send-email trigger error:", error));
+    }).catch((error) => console.error("send-email trigger error:", error instanceof Error ? error.message : error));
 
     return json({ success: true });
   } catch (error) {
